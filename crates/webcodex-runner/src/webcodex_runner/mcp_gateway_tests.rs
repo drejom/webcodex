@@ -240,7 +240,7 @@ fn provider_admission_timeout_preserves_connection_and_does_not_dispatch() {
         assert_eq!(error.dispatch_state, McpGatewayDispatchState::NotStarted);
         assert!(!error.fatal);
         let response = provider_failure_response(error);
-        assert!(response.error.unwrap().message.contains("retry serially"));
+        assert_eq!(response.error.unwrap().code, "provider_busy");
     });
     assert!(occupied.is_some());
     drop(occupied);

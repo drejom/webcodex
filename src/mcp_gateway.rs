@@ -708,7 +708,18 @@ fn gateway_error_result(mut error: GatewayError) -> Value {
             "Wait briefly and retry serially with the original arguments and any idempotency key; use bounded retries.",
         );
     }
-    let text = bounded_gateway_error_fallback(&error.message);
+    // Some hosts expose only content text. Keep recovery canonical in the
+    // structured result while projecting the same instruction into its fallback.
+    let fallback = if error.code == "provider_busy"
+        && error.dispatch_state == Some(McpGatewayDispatchState::NotStarted)
+    {
+        error
+            .recovery
+            .map(|recovery| format!("{} {recovery}", error.message))
+    } else {
+        None
+    };
+    let text = bounded_gateway_error_fallback(fallback.as_deref().unwrap_or(&error.message));
     let dispatch_state = error.dispatch_state.map(dispatch_state_name);
     let mut structured = json!({
         "error": {
@@ -758,8 +769,16 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("original arguments and any idempotency key"));
+                assert!(result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("original arguments and any idempotency key"));
             } else {
                 assert!(result["structuredContent"].get("recovery").is_none());
+                assert!(!result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry"));
             }
         }
     }

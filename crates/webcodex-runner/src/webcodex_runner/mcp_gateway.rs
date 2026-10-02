@@ -1165,9 +1165,6 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
 fn provider_failure_response(error: ProviderFailure) -> McpGatewayResponse {
     let state = error.dispatch_state;
     let message = match state {
-        McpGatewayDispatchState::NotStarted if error.code == "provider_busy" => {
-            "Provider request was not started; no downstream effect was dispatched. Wait briefly and retry serially with the original arguments and any idempotency key; use bounded retries."
-        }
         McpGatewayDispatchState::NotStarted => {
             "Provider request was not started; no downstream effect was dispatched"
         }
