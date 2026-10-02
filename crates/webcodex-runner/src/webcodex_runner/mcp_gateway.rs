@@ -54,6 +54,7 @@ struct ProviderEntry {
     config: McpGatewayProviderConfig,
     instance_id: String,
     lifecycle: AtomicU8,
+    accepting_requests: AtomicBool,
     session: Mutex<Option<ProviderConnection>>,
 }
 
@@ -200,6 +201,7 @@ impl McpGatewayManager {
                     }
                     Some(existing) => {
                         replaced += 1;
+                        existing.accepting_requests.store(false, Ordering::SeqCst);
                         retired.push(existing);
                         next.insert(
                             provider_config.id.clone(),
@@ -216,7 +218,10 @@ impl McpGatewayManager {
                 }
             }
             let removed = current.len();
-            retired.extend(current.into_values());
+            for existing in current.into_values() {
+                existing.accepting_requests.store(false, Ordering::SeqCst);
+                retired.push(existing);
+            }
             state.providers = next;
             state.request_timeout = Duration::from_secs(config.request_timeout_secs.clamp(1, 120));
             summary = McpGatewayReloadSummary {
@@ -312,6 +317,7 @@ impl McpGatewayManager {
                         if remaining.is_zero() {
                             return Err(ProviderFailure::not_started("provider_timeout"));
                         }
+                        self.commit_provider_dispatch(&provider)?;
                         connection.tools_call(&name, arguments, remaining)
                     },
                 ) {
@@ -337,6 +343,20 @@ impl McpGatewayManager {
         self.exact_provider(provider_id, provider_instance_id)
             .map(|_| ())
             .ok_or_else(|| ProviderFailure::not_started("stale_provider"))
+    }
+
+    fn commit_provider_dispatch(&self, provider: &ProviderEntry) -> Result<(), ProviderFailure> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("runner_stopping"));
+        }
+        // Config replacement flips this bit while still holding the routing
+        // write lock. This SeqCst load is the effect-dispatch linearization
+        // point: earlier retirement fences the call; later retirement is
+        // ordered after this request was admitted for dispatch.
+        if !provider.accepting_requests.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("stale_provider"));
+        }
+        Ok(())
     }
 
     fn exact_provider(
@@ -388,11 +408,13 @@ impl ProviderEntry {
             config,
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
             lifecycle: AtomicU8::new(PROVIDER_NEVER_STARTED),
+            accepting_requests: AtomicBool::new(true),
             session: Mutex::new(None),
         }
     }
 
     fn retire_connection_nonblocking(&self) {
+        self.accepting_requests.store(false, Ordering::SeqCst);
         self.lifecycle
             .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
         match self.session.try_lock() {

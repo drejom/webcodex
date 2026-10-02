@@ -300,6 +300,53 @@ fn queued_provider_call_does_not_dispatch_after_replacement_or_stop() {
 }
 
 #[test]
+fn provider_effect_is_fenced_when_replaced_or_stopped_during_schema_preflight() {
+    for replace in [true, false] {
+        let fixture = Fixture::new("slow_second_list", 2);
+        let provider = fixture.provider();
+        assert!(fixture.list(&provider).error.is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| tx.send(fixture.call(&provider)).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fixture.marker_count("preflight-wait") == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider call never entered schema preflight"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if replace {
+                fixture
+                    .manager
+                    .apply_config_candidate(&replacement_config(
+                        &fixture,
+                        "fake",
+                        "Replacement",
+                        "normal",
+                        2,
+                    ))
+                    .unwrap();
+            } else {
+                fixture.manager.stopping.store(true, Ordering::SeqCst);
+            }
+            let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+            assert_eq!(
+                response.error.unwrap().code,
+                if replace {
+                    "stale_provider"
+                } else {
+                    "runner_stopping"
+                }
+            );
+        });
+        assert_eq!(fixture.marker_count("call"), 0);
+        assert_eq!(fixture.marker_count("start"), 1);
+    }
+}
+
+#[test]
 fn provider_status_is_passive_and_tracks_connection_lifecycle() {
     let fixture = Fixture::new("crash", 2);
     let provider = fixture.provider();
