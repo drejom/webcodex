@@ -269,9 +269,11 @@ impl McpGatewayManager {
                 else {
                     return stale_provider();
                 };
-                match provider.with_connection(timeout, |connection, timeout| {
-                    connection.tools_list(timeout)
-                }) {
+                match provider.with_connection(
+                    timeout,
+                    || self.check_provider_admission(&provider_id, &provider_instance_id),
+                    |connection, timeout| connection.tools_list(timeout),
+                ) {
                     Ok(tools) => {
                         McpGatewayResponse::success(McpGatewayResponsePayload::Tools { tools })
                     }
@@ -290,25 +292,29 @@ impl McpGatewayManager {
                 else {
                     return stale_provider();
                 };
-                match provider.with_connection(timeout, |connection, timeout| {
-                    let started = Instant::now();
-                    let tools = connection
-                        .tools_list(timeout)
-                        .map_err(ProviderFailure::preflight)?;
-                    let Some(current) = tools.iter().find(|tool| tool.name == name) else {
-                        return Err(ProviderFailure::not_started("provider_tool_missing"));
-                    };
-                    if current.schema_observation() != expected_schema {
-                        return Err(ProviderFailure::not_started("provider_schema_changed"));
-                    }
-                    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-                        return Err(ProviderFailure::not_started("provider_timeout"));
-                    };
-                    if remaining.is_zero() {
-                        return Err(ProviderFailure::not_started("provider_timeout"));
-                    }
-                    connection.tools_call(&name, arguments, remaining)
-                }) {
+                match provider.with_connection(
+                    timeout,
+                    || self.check_provider_admission(&provider_id, &provider_instance_id),
+                    |connection, timeout| {
+                        let started = Instant::now();
+                        let tools = connection
+                            .tools_list(timeout)
+                            .map_err(ProviderFailure::preflight)?;
+                        let Some(current) = tools.iter().find(|tool| tool.name == name) else {
+                            return Err(ProviderFailure::not_started("provider_tool_missing"));
+                        };
+                        if current.schema_observation() != expected_schema {
+                            return Err(ProviderFailure::not_started("provider_schema_changed"));
+                        }
+                        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                            return Err(ProviderFailure::not_started("provider_timeout"));
+                        };
+                        if remaining.is_zero() {
+                            return Err(ProviderFailure::not_started("provider_timeout"));
+                        }
+                        connection.tools_call(&name, arguments, remaining)
+                    },
+                ) {
                     Ok(result) => {
                         McpGatewayResponse::success(McpGatewayResponsePayload::ToolResult {
                             result,
@@ -318,6 +324,19 @@ impl McpGatewayManager {
                 }
             }
         }
+    }
+
+    fn check_provider_admission(
+        &self,
+        provider_id: &str,
+        provider_instance_id: &str,
+    ) -> Result<(), ProviderFailure> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("runner_stopping"));
+        }
+        self.exact_provider(provider_id, provider_instance_id)
+            .map(|_| ())
+            .ok_or_else(|| ProviderFailure::not_started("stale_provider"))
     }
 
     fn exact_provider(
@@ -449,24 +468,36 @@ impl ProviderEntry {
     fn with_connection<T>(
         &self,
         timeout: Duration,
+        admission_check: impl Fn() -> Result<(), ProviderFailure>,
         operation: impl FnOnce(&mut ProviderConnection, Duration) -> Result<T, ProviderFailure>,
     ) -> Result<T, ProviderFailure> {
-        let mut session = match self.session.try_lock() {
-            Ok(session) => session,
-            Err(TryLockError::WouldBlock) => {
-                return Err(ProviderFailure {
-                    code: "provider_busy",
-                    dispatch_state: McpGatewayDispatchState::NotStarted,
-                    fatal: false,
-                })
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(ProviderFailure::before_send("provider_unavailable"));
+        let started = Instant::now();
+        let admission_budget = timeout.min(Duration::from_secs(2));
+        let mut session = loop {
+            admission_check()?;
+            match self.session.try_lock() {
+                Ok(session) => break session,
+                Err(TryLockError::WouldBlock) => {
+                    let Some(remaining) = admission_budget
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                    else {
+                        return Err(ProviderFailure::not_started("provider_busy"));
+                    };
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(ProviderFailure::before_send("provider_unavailable"));
+                }
             }
         };
-        let started = Instant::now();
+        admission_check()?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| ProviderFailure::not_started("provider_busy"))?;
         if session.is_none() {
-            match ProviderConnection::spawn(&self.config, timeout) {
+            match ProviderConnection::spawn(&self.config, remaining) {
                 Ok(connection) => {
                     self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
                     *session = Some(connection);
@@ -494,6 +525,7 @@ impl ProviderEntry {
             }
             return Err(ProviderFailure::before_send("provider_timeout"));
         };
+        admission_check()?;
         let result = operation(
             session.as_mut().expect("provider connection initialized"),
             remaining,
@@ -1133,6 +1165,9 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
 fn provider_failure_response(error: ProviderFailure) -> McpGatewayResponse {
     let state = error.dispatch_state;
     let message = match state {
+        McpGatewayDispatchState::NotStarted if error.code == "provider_busy" => {
+            "Provider request was not started; no downstream effect was dispatched. Wait briefly and retry serially with the original arguments and any idempotency key; use bounded retries."
+        }
         McpGatewayDispatchState::NotStarted => {
             "Provider request was not started; no downstream effect was dispatched"
         }

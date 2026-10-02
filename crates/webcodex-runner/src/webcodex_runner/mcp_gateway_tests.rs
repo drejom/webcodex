@@ -183,6 +183,123 @@ fn provider_state(response: McpGatewayResponse) -> McpGatewayProviderState {
 }
 
 #[test]
+fn concurrent_provider_call_waits_for_existing_connection() {
+    let fixture = Fixture::new("normal", 2);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let entry = {
+        let state = fixture.manager.state.read().unwrap();
+        Arc::clone(state.providers.get("fake").unwrap())
+    };
+    let occupied = entry.session.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            result_tx.send(fixture.call(&provider)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(50));
+        drop(occupied);
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "overlapping call must wait, got {early:?}"
+        );
+        let completed = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(completed.error.is_none(), "{completed:?}");
+        assert_eq!(completed.dispatch_state, McpGatewayDispatchState::Completed);
+    });
+    assert_eq!(fixture.marker_count("call"), 1);
+    assert_eq!(fixture.marker_count("start"), 1);
+}
+
+#[test]
+fn provider_admission_timeout_preserves_connection_and_does_not_dispatch() {
+    let fixture = Fixture::new("normal", 2);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let entry = {
+        let state = fixture.manager.state.read().unwrap();
+        Arc::clone(state.providers.get("fake").unwrap())
+    };
+    let occupied = entry.session.lock().unwrap();
+    std::thread::scope(|scope| {
+        let result = scope
+            .spawn(|| {
+                entry.with_connection(
+                    Duration::from_millis(35),
+                    || Ok(()),
+                    |_, _| -> Result<(), ProviderFailure> { panic!("must not dispatch") },
+                )
+            })
+            .join()
+            .unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "provider_busy");
+        assert_eq!(error.dispatch_state, McpGatewayDispatchState::NotStarted);
+        assert!(!error.fatal);
+        let response = provider_failure_response(error);
+        assert!(response.error.unwrap().message.contains("retry serially"));
+    });
+    assert!(occupied.is_some());
+    drop(occupied);
+    assert_eq!(fixture.marker_count("call"), 0);
+    assert!(fixture.call(&provider).error.is_none());
+    assert_eq!(fixture.marker_count("call"), 1);
+    assert_eq!(fixture.marker_count("start"), 1);
+}
+
+#[test]
+fn queued_provider_call_does_not_dispatch_after_replacement_or_stop() {
+    for replace in [true, false] {
+        let fixture = Fixture::new("normal", 2);
+        let provider = fixture.provider();
+        assert!(fixture.list(&provider).error.is_none());
+        let entry = {
+            let state = fixture.manager.state.read().unwrap();
+            Arc::clone(state.providers.get("fake").unwrap())
+        };
+        let occupied = entry.session.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| tx.send(fixture.call(&provider)).unwrap());
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            if replace {
+                fixture
+                    .manager
+                    .apply_config_candidate(&replacement_config(
+                        &fixture,
+                        "fake",
+                        "Replacement",
+                        "normal",
+                        2,
+                    ))
+                    .unwrap();
+            } else {
+                fixture.manager.stopping.store(true, Ordering::SeqCst);
+            }
+            let response = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+            assert_eq!(
+                response.error.unwrap().code,
+                if replace {
+                    "stale_provider"
+                } else {
+                    "runner_stopping"
+                }
+            );
+            drop(occupied);
+        });
+        assert_eq!(fixture.marker_count("call"), 0);
+        assert_eq!(fixture.marker_count("start"), 1);
+    }
+}
+
+#[test]
 fn provider_status_is_passive_and_tracks_connection_lifecycle() {
     let fixture = Fixture::new("crash", 2);
     let provider = fixture.provider();

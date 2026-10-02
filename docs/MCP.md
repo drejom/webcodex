@@ -256,6 +256,8 @@ Recovery fields in a result describe the next safe **explicit** call. They never
 
 A hosted Server can expose Runner-owned local stdio MCP providers through the same `/mcp` endpoint. Authorized callers use the single `mcp_tool` entry to list, describe, and call configured providers; provider process/instance identities and schema-revision state stay internal.
 
+Calls sharing a provider connection wait up to two seconds within the original request deadline. If `provider_busy` reports `dispatchState=not_started`, wait briefly and retry serially with the original arguments and any idempotency key, using bounded retries. Reconcile `outcome_unknown` before repeating an effect.
+
 Configure local providers on the Runner under `[mcp]`. Access requires the explicit `mcp:local` permission; hosted OAuth clients opt in with `webcodex connect ... --oauth-local-mcp`. See [Runner](RUNNER.md#provider-side-gateway-v1-compatibility) for provider compatibility details.
 
 ### Managed SSH resource onboarding

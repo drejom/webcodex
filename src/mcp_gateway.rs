@@ -132,7 +132,7 @@ pub(crate) fn authorized(auth: Option<&AuthContext>) -> bool {
 pub(crate) fn tool_spec() -> Value {
     json!({
         "name": MCP_TOOL_NAME,
-        "description": "Access explicitly authorized Runner-owned local MCP servers through WebCodex's built-in gateway. No-argument action=list reports registration routing resolvability. action=status with server passively reports bounded provider lifecycle state without starting, initializing, or pinging the provider; healthy means the retained connection's child is still running, not an end-to-end protocol probe. action=list with server and action=describe interact with the provider. Use action=describe before action=call, and re-describe when WebCodex reports a schema change. Provider process identities, paths, stderr, environment, and schema revision tokens are intentionally hidden.",
+        "description": "Access explicitly authorized Runner-owned local MCP servers through WebCodex's built-in gateway. No-argument action=list reports registration routing resolvability. action=status with server passively reports bounded provider lifecycle state without starting, initializing, or pinging the provider; healthy means the retained connection's child is still running, not an end-to-end protocol probe. action=list with server and action=describe interact with the provider. Use action=describe before action=call, and re-describe when WebCodex reports a schema change. For provider_busy with dispatchState=not_started, wait briefly and retry serially with the original arguments and any idempotency key, using bounded retries. Reconcile outcome_unknown before repeating an effect. Provider process identities, paths, stderr, environment, and schema revision tokens are intentionally hidden.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -179,7 +179,7 @@ pub(crate) async fn call(
             return gateway_error_result(GatewayError::local(
                 "invalid_arguments",
                 "mcp_tool arguments are invalid",
-            ))
+            ));
         }
     };
 
@@ -699,7 +699,15 @@ fn bounded_gateway_error_fallback(message: &str) -> String {
     message[..end].to_string()
 }
 
-fn gateway_error_result(error: GatewayError) -> Value {
+fn gateway_error_result(mut error: GatewayError) -> Value {
+    if error.code == "provider_busy"
+        && error.dispatch_state == Some(McpGatewayDispatchState::NotStarted)
+        && error.recovery.is_none()
+    {
+        error.recovery = Some(
+            "Wait briefly and retry serially with the original arguments and any idempotency key; use bounded retries.",
+        );
+    }
     let text = bounded_gateway_error_fallback(&error.message);
     let dispatch_state = error.dispatch_state.map(dispatch_state_name);
     let mut structured = json!({
@@ -732,6 +740,29 @@ fn dispatch_state_name(state: McpGatewayDispatchState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_busy_recovery_requires_confirmed_non_dispatch() {
+        for state in [
+            McpGatewayDispatchState::NotStarted,
+            McpGatewayDispatchState::OutcomeUnknown,
+        ] {
+            let result = gateway_error_result(GatewayError {
+                code: "provider_busy".to_string(),
+                message: "Provider request unavailable".to_string(),
+                recovery: None,
+                dispatch_state: Some(state),
+            });
+            if state == McpGatewayDispatchState::NotStarted {
+                assert!(result["structuredContent"]["recovery"]
+                    .as_str()
+                    .unwrap()
+                    .contains("original arguments and any idempotency key"));
+            } else {
+                assert!(result["structuredContent"].get("recovery").is_none());
+            }
+        }
+    }
 
     #[test]
     fn webcodex_generated_gateway_results_keep_canonical_data_only_in_structured_content() {
