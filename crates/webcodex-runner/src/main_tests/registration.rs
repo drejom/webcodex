@@ -15,6 +15,7 @@ fn mcp_gateway_register_request_projects_bounded_provider_inventory_without_loca
             "OPERATOR_GITHUB_TOKEN".to_string(),
         )]),
         timeout_secs: Some(5),
+        supervisor_socket: None,
     }];
 
     let body = build_register_request(&cfg, "runner-instance", 0);

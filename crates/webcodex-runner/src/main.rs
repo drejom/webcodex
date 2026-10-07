@@ -1,4 +1,6 @@
 //! Runner process entry: argument parsing, startup and exit only.
+#[cfg(target_os = "linux")]
+mod mcp_supervisor;
 mod webcodex_runner;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -21,6 +23,10 @@ enum RunnerCliAction {
     },
     ComputerSessionHelper {
         session_state_dir: PathBuf,
+    },
+    /// Root MCP-only supervisor service; see `mcp_supervisor`.
+    McpSupervisor {
+        profile_path: PathBuf,
     },
     Exit {
         code: i32,
@@ -100,6 +106,14 @@ where
         }
         return Ok(RunnerCliAction::ComputerSessionHelper {
             session_state_dir: PathBuf::from(&args[2]),
+        });
+    }
+    if args.first().is_some_and(|arg| arg == "--mcp-supervisor") {
+        if args.len() != 3 || args[1] != "--profile-path" || args[2].is_empty() {
+            return Err("MCP supervisor requires only --profile-path PATH".to_string());
+        }
+        return Ok(RunnerCliAction::McpSupervisor {
+            profile_path: PathBuf::from(&args[2]),
         });
     }
     if args.len() == 1 {
@@ -305,6 +319,23 @@ fn main() {
         RunnerCliAction::ComputerSessionHelper { session_state_dir } => {
             if let Err(error) = webcodex_runner::computer_session::run_helper(&session_state_dir) {
                 eprintln!("{error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        RunnerCliAction::McpSupervisor { profile_path } => {
+            #[cfg(target_os = "linux")]
+            let result = mcp_supervisor::serve::run(&profile_path);
+            #[cfg(not(target_os = "linux"))]
+            let result: std::io::Result<()> = {
+                let _ = profile_path;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "MCP supervisor is Linux-only",
+                ))
+            };
+            if let Err(error) = result {
+                eprintln!("webcodex-runner MCP supervisor failed: {error}");
                 std::process::exit(2);
             }
             return;

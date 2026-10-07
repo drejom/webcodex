@@ -59,10 +59,29 @@ struct ProviderEntry {
 }
 
 struct ProviderConnection {
-    child: ManagedChild,
-    stdin: ChildStdin,
-    incoming: mpsc::Receiver<ReaderEvent>,
+    transport: Transport,
     next_id: u64,
+}
+
+enum Transport {
+    Local {
+        child: ManagedChild,
+        stdin: ChildStdin,
+        incoming: mpsc::Receiver<ReaderEvent>,
+    },
+    /// The protected supervisor owns the process, ids on the provider wire,
+    /// servicing prepare/revoke and generation cleanup. Dropping this closes
+    /// the control channel, which makes the supervisor kill the generation.
+    #[cfg(target_os = "linux")]
+    Supervised(crate::mcp_supervisor::SupervisedConnection),
+}
+
+/// Native identity of the dispatched Runner invocation. Only the supervised
+/// transport forwards it, to the operator-configured servicing authority.
+pub(crate) struct NativeDispatch<'a> {
+    pub(crate) request_id: &'a str,
+    pub(crate) client_id: &'a str,
+    pub(crate) runner_instance_id: &'a str,
 }
 
 enum ReaderEvent {
@@ -237,7 +256,16 @@ impl McpGatewayManager {
         Ok(summary)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle(&self, request: McpGatewayRequest) -> McpGatewayResponse {
+        self.handle_dispatched(request, None)
+    }
+
+    pub(crate) fn handle_dispatched(
+        &self,
+        request: McpGatewayRequest,
+        native: Option<NativeDispatch<'_>>,
+    ) -> McpGatewayResponse {
         if self.stopping.load(Ordering::SeqCst) {
             return bridge_error(
                 McpGatewayDispatchState::NotStarted,
@@ -318,7 +346,7 @@ impl McpGatewayManager {
                             return Err(ProviderFailure::not_started("provider_timeout"));
                         }
                         self.commit_provider_dispatch(&provider)?;
-                        connection.tools_call(&name, arguments, remaining)
+                        connection.tools_call(&name, arguments, remaining, native.as_ref())
                     },
                 ) {
                     Ok(result) => {
@@ -463,12 +491,12 @@ impl ProviderEntry {
             Err(TryLockError::Poisoned(_)) => return McpGatewayProviderState::ConnectionRetired,
         };
         if let Some(connection) = session.as_mut() {
-            match connection.child.try_wait() {
-                Ok(None) => {
+            match connection.alive() {
+                Ok(true) => {
                     self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
                     return McpGatewayProviderState::Healthy;
                 }
-                Ok(Some(_)) | Err(_) => {
+                Ok(false) | Err(_) => {
                     // Reap/drop the dead owned connection without starting a
                     // replacement. A later explicit interaction owns reconnect.
                     drop(session.take());
@@ -651,6 +679,9 @@ impl ProviderConnection {
         config: &McpGatewayProviderConfig,
         timeout: Duration,
     ) -> Result<Self, ProviderFailure> {
+        if let Some(socket) = config.supervisor_socket.as_deref() {
+            return Self::spawn_supervised(config, socket, timeout);
+        }
         // Resolve the complete operator-declared execution context before
         // creating the child. Missing env sources or unavailable cwd therefore
         // cannot produce a partially initialized provider process.
@@ -705,12 +736,50 @@ impl ProviderConnection {
             .map_err(|_| ProviderFailure::before_send("provider_reader_unavailable"))?;
 
         let mut connection = Self {
-            child,
-            stdin,
-            incoming,
+            transport: Transport::Local {
+                child,
+                stdin,
+                incoming,
+            },
             next_id: 1,
         };
-        let initialized = connection.request(
+        connection.initialize(timeout)?;
+        Ok(connection)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_supervised(
+        config: &McpGatewayProviderConfig,
+        socket: &str,
+        timeout: Duration,
+    ) -> Result<Self, ProviderFailure> {
+        let supervised = crate::mcp_supervisor::SupervisedConnection::open(
+            std::path::Path::new(socket),
+            &config.id,
+            timeout,
+        )
+        .map_err(|_| ProviderFailure::before_send("provider_supervisor_unavailable"))?;
+        let mut connection = Self {
+            transport: Transport::Supervised(supervised),
+            next_id: 1,
+        };
+        connection.initialize(timeout)?;
+        Ok(connection)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_supervised(
+        _config: &McpGatewayProviderConfig,
+        _socket: &str,
+        _timeout: Duration,
+    ) -> Result<Self, ProviderFailure> {
+        Err(ProviderFailure::before_send(
+            "provider_supervisor_unavailable",
+        ))
+    }
+
+    fn initialize(&mut self, timeout: Duration) -> Result<(), ProviderFailure> {
+        let initialized = self.request(
             "initialize",
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -723,8 +792,15 @@ impl ProviderConnection {
             timeout,
         )?;
         validate_initialize_result(&initialized)?;
-        connection.send_notification("notifications/initialized", json!({}))?;
-        Ok(connection)
+        self.send_notification("notifications/initialized", json!({}))
+    }
+
+    fn alive(&mut self) -> std::io::Result<bool> {
+        match &mut self.transport {
+            Transport::Local { child, .. } => child.try_wait().map(|status| status.is_none()),
+            #[cfg(target_os = "linux")]
+            Transport::Supervised(supervised) => Ok(!supervised.closed()),
+        }
     }
 
     fn tools_list(&mut self, timeout: Duration) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
@@ -803,11 +879,34 @@ impl ProviderConnection {
         name: &str,
         arguments: Value,
         timeout: Duration,
+        native: Option<&NativeDispatch<'_>>,
     ) -> Result<McpGatewayToolResult, ProviderFailure> {
         // Outer MCP caller metadata deliberately stops at the WebCodex trust
         // boundary. Provider tools/call receives only gateway-owned fields.
-        let params = json!({"name": name, "arguments": arguments});
-        let result = self.request("tools/call", params, timeout)?;
+        let result = match &mut self.transport {
+            Transport::Local { .. } => {
+                let params = json!({"name": name, "arguments": arguments});
+                self.request("tools/call", params, timeout)?
+            }
+            #[cfg(target_os = "linux")]
+            Transport::Supervised(supervised) => {
+                // The servicing authority cannot associate an anonymous call.
+                let Some(native) = native else {
+                    return Err(ProviderFailure::not_started(
+                        "provider_native_identity_missing",
+                    ));
+                };
+                let fence = crate::mcp_supervisor::NativeFence {
+                    request_id: native.request_id.to_string(),
+                    client_id: native.client_id.to_string(),
+                    runner_instance_id: native.runner_instance_id.to_string(),
+                };
+                let response = supervised
+                    .call(&fence, name, arguments, timeout)
+                    .map_err(supervised_failure)?;
+                validate_supervised_response(response)?
+            }
+        };
         validate_provider_tool_result_structure(&result)?;
         let object = result
             .as_object()
@@ -878,9 +977,21 @@ impl ProviderConnection {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, ProviderFailure> {
+        let (stdin, incoming) = match &mut self.transport {
+            Transport::Local {
+                stdin, incoming, ..
+            } => (stdin, incoming),
+            #[cfg(target_os = "linux")]
+            Transport::Supervised(supervised) => {
+                let response = supervised
+                    .request(method, params, timeout)
+                    .map_err(supervised_failure)?;
+                return validate_supervised_response(response);
+            }
+        };
         let mut ignored_notifications = 0usize;
         loop {
-            match self.incoming.try_recv() {
+            match incoming.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) | Ok(ReaderEvent::Eof) => {
                     return Err(ProviderFailure::before_send("provider_eof"));
@@ -943,9 +1054,9 @@ impl ProviderConnection {
             return Err(ProviderFailure::before_send("provider_request_too_large"));
         }
         encoded.push(b'\n');
-        self.stdin
+        stdin
             .write_all(&encoded)
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.flush())
             .map_err(|_| ProviderFailure::after_send("provider_stdin_failed"))?;
 
         let deadline = Instant::now() + timeout;
@@ -955,7 +1066,7 @@ impl ProviderConnection {
             if remaining.is_zero() {
                 return Err(ProviderFailure::after_send("provider_timeout"));
             }
-            let response = match self.incoming.recv_timeout(remaining) {
+            let response = match incoming.recv_timeout(remaining) {
                 Ok(ReaderEvent::Message(Ok(response))) => response,
                 Ok(ReaderEvent::Message(Err(ReaderFault::Malformed))) => {
                     return Err(ProviderFailure::after_send("provider_malformed_json"));
@@ -990,6 +1101,16 @@ impl ProviderConnection {
     }
 
     fn send_notification(&mut self, method: &str, params: Value) -> Result<(), ProviderFailure> {
+        let stdin = match &mut self.transport {
+            Transport::Local { stdin, .. } => stdin,
+            #[cfg(target_os = "linux")]
+            Transport::Supervised(supervised) => {
+                let _ = params;
+                return supervised
+                    .notify(method, Duration::from_secs(5))
+                    .map_err(|_| ProviderFailure::before_send("provider_stdin_failed"));
+            }
+        };
         let message = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -1001,24 +1122,31 @@ impl ProviderConnection {
             return Err(ProviderFailure::before_send("provider_request_too_large"));
         }
         encoded.push(b'\n');
-        self.stdin
+        stdin
             .write_all(&encoded)
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.flush())
             .map_err(|_| ProviderFailure::before_send("provider_stdin_failed"))
     }
 
     fn terminate(&mut self) {
+        let child = match &mut self.transport {
+            Transport::Local { child, .. } => child,
+            #[cfg(target_os = "linux")]
+            Transport::Supervised(supervised) => {
+                // The supervisor kills the generation when control closes.
+                supervised.close();
+                return;
+            }
+        };
         // Never let provider cleanup turn Runner shutdown into an unbounded
         // wait. ManagedChild owns the complete process tree; force termination
         // first, then spend one shared bounded deadline confirming tree exit
         // and reaping the direct child. Drop remains the final fail-safe.
         let deadline = Instant::now() + Duration::from_secs(1);
-        let _ = self.child.terminate_tree();
-        let _ = self
-            .child
-            .wait_tree_exit(deadline.saturating_duration_since(Instant::now()));
+        let _ = child.terminate_tree();
+        let _ = child.wait_tree_exit(deadline.saturating_duration_since(Instant::now()));
         loop {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(_)) | Err(_) => return,
                 Ok(None) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1156,6 +1284,32 @@ fn validate_rpc_response(response: Value, expected_id: u64) -> Result<Value, Pro
     }
 }
 
+/// The supervisor allocates provider wire ids and has already checked that
+/// the response correlates with its request; validate everything else here.
+#[cfg(target_os = "linux")]
+fn validate_supervised_response(response: Value) -> Result<Value, ProviderFailure> {
+    let id = response
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProviderFailure::after_send("provider_response_id_invalid"))?;
+    validate_rpc_response(response, id)
+}
+
+#[cfg(target_os = "linux")]
+fn supervised_failure(failure: crate::mcp_supervisor::client::ClientFailure) -> ProviderFailure {
+    use crate::mcp_supervisor::wire::Dispatch;
+    // Supervisor failure codes are not echoed; only the dispatch state and a
+    // fixed code cross into the bridge response.
+    match failure.dispatch {
+        Dispatch::NotStarted if failure.code.starts_with("servicing_") => {
+            ProviderFailure::not_started("provider_servicing_refused")
+        }
+        Dispatch::NotStarted => ProviderFailure::before_send("provider_supervisor_failed"),
+        Dispatch::OutcomeUnknown => ProviderFailure::after_send("provider_supervisor_failed"),
+        Dispatch::Completed => ProviderFailure::completed("provider_supervisor_failed"),
+    }
+}
+
 fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
     validate_json_value(
         result,
@@ -1224,3 +1378,13 @@ fn stale_provider() -> McpGatewayResponse {
 #[cfg(test)]
 #[path = "mcp_gateway_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod tests_support {
+    /// Path of the compiled fake MCP provider, kept alive for the test run.
+    pub(crate) fn fake_binary_path() -> std::path::PathBuf {
+        static KEEP: std::sync::OnceLock<std::sync::Arc<super::tests::FakeBinary>> =
+            std::sync::OnceLock::new();
+        KEEP.get_or_init(super::tests::fake_binary).path.clone()
+    }
+}

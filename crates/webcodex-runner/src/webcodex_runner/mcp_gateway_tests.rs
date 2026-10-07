@@ -15,12 +15,12 @@ static FAKE_SERVER: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
 const TEST_PARALLEL_TIMEOUT_FLOOR_SECS: u64 = 10;
 const TEST_INTENTIONAL_TIMEOUT_SECS: u64 = 5;
 
-struct FakeBinary {
+pub(crate) struct FakeBinary {
     _temp: TempDir,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
-fn fake_binary() -> Arc<FakeBinary> {
+pub(crate) fn fake_binary() -> Arc<FakeBinary> {
     let cache = FAKE_SERVER.get_or_init(|| Mutex::new(Weak::new()));
     let mut cached = cache
         .lock()
@@ -117,6 +117,7 @@ impl Fixture {
                 cwd,
                 env_from_env,
                 timeout_secs: provider_timeout_secs,
+                supervisor_socket: None,
             }],
         });
         Self {
@@ -449,6 +450,7 @@ fn replacement_config(
             cwd: None,
             env_from_env: BTreeMap::new(),
             timeout_secs: None,
+            supervisor_socket: None,
         }],
     }
 }

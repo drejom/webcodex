@@ -410,9 +410,18 @@ pub(crate) fn dispatch_request_with_outcome(
             sink.submit_coding_agent_result(request_id, response)
                 .map(|_| true)
         }
-        RunnerOperation::McpGateway(operation) => sink
-            .submit_mcp_gateway_result(request_id, runtime.mcp_gateway().handle(operation))
-            .map(|_| true),
+        RunnerOperation::McpGateway(operation) => {
+            let response = runtime.mcp_gateway().handle_dispatched(
+                operation,
+                Some(super::mcp_gateway::NativeDispatch {
+                    request_id: &request_id,
+                    client_id: &client_id,
+                    runner_instance_id: sink.runner_instance_id(),
+                }),
+            );
+            sink.submit_mcp_gateway_result(request_id, response)
+                .map(|_| true)
+        }
         RunnerOperation::PluginGateway(operation) => {
             let response = match operation {
                 webcodex_core::plugin::PluginGatewayRequest::ProjectCatalog { project_id } => {

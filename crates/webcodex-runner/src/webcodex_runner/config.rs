@@ -213,6 +213,12 @@ pub(crate) struct McpGatewayProviderConfig {
     /// `mcp.request_timeout_secs`.
     #[serde(default)]
     pub(crate) timeout_secs: Option<u64>,
+    /// Linux only. When set, the Runner does not spawn `executable`; it asks
+    /// the protected MCP supervisor at this socket to open the provider whose
+    /// operator profile id equals `id`. The supervisor profile, not this file,
+    /// selects the executable and identity. Unavailable means unavailable.
+    #[serde(default)]
+    pub(crate) supervisor_socket: Option<String>,
 }
 
 fn default_mcp_gateway_request_timeout_secs() -> u64 {
@@ -1964,6 +1970,24 @@ fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> 
         if !ids.insert(provider.id.as_str()) {
             return Err("mcp provider ids must be unique".to_string());
         }
+        if let Some(socket) = provider.supervisor_socket.as_deref() {
+            if !cfg!(target_os = "linux") {
+                return Err(format!(
+                    "mcp provider '{}' supervisor_socket is supported only on Linux",
+                    provider.id
+                ));
+            }
+            if socket.is_empty()
+                || socket.len() > 107
+                || socket.contains('\0')
+                || !Path::new(socket).is_absolute()
+            {
+                return Err(format!(
+                    "mcp provider '{}' supervisor_socket must be an absolute path of at most 107 bytes",
+                    provider.id
+                ));
+            }
+        }
         if provider.executable.is_empty()
             || provider.executable.len() > 1_024
             || provider.executable.contains('\0')
@@ -2279,6 +2303,7 @@ mod mcp_gateway_config_tests {
             cwd: None,
             env_from_env: BTreeMap::new(),
             timeout_secs: None,
+            supervisor_socket: None,
         }
     }
 
