@@ -76,8 +76,12 @@ impl Profile {
         if text.len() as u64 > PROFILE_BYTES {
             return Err(invalid("supervisor profile too large"));
         }
+        Self::parse(&text)
+    }
+
+    fn parse(text: &str) -> io::Result<Self> {
         let disk: DiskProfile =
-            toml::from_str(&text).map_err(|_| invalid("supervisor profile invalid"))?;
+            toml::from_str(text).map_err(|_| invalid("supervisor profile invalid"))?;
         absolute(&disk.socket)?;
         if disk.runner_uid == 0 {
             return Err(invalid("runner_uid must not be root"));
@@ -242,6 +246,36 @@ mod tests {
         assert!(Provider::from_disk(disk(1001), 1001).is_err());
         assert!(Provider::from_disk(disk(0), 1001).is_err());
         assert!(Provider::from_disk(disk(1002), 1001).is_ok());
+    }
+
+    #[test]
+    fn omhq_workbench_rendered_profile_parses() {
+        // Rendered by OMHQ ansible/roles/workbench/templates/webcodex-mcp-supervisor.toml.j2.
+        let text = r#"
+socket = "/run/webcodex-mcp-supervisor-other-cloud-personal/supervisor.sock"
+runner_uid = 1011
+runner_unit = "webcodex-runner-other-cloud-personal.service"
+
+[[providers]]
+id = "omhq"
+executable = "/opt/omhq-acg/venv/bin/python"
+args = ["/usr/local/libexec/webcodex_acg_mcp.py"]
+cwd = "/"
+uid = 1013
+gid = 1013
+servicing_socket = "/run/omhq-acg-other-cloud-personal/servicing.sock"
+
+[providers.environment]
+OMHQ_ACG_SOCKET = "/run/omhq-acg-other-cloud-personal/acg.sock"
+HOME = "/nonexistent"
+"#;
+        let profile = Profile::parse(text).unwrap();
+        let provider = profile.provider("omhq").unwrap();
+        assert_eq!((provider.uid, provider.gid), (1013, 1013));
+        assert!(matches!(
+            profile.peer,
+            PeerPolicy::RunnerUnit { uid: 1011, .. }
+        ));
     }
 
     #[test]
