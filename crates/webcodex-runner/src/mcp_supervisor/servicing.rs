@@ -115,12 +115,30 @@ pub(crate) fn revoke(socket: &Path, preparation: &Preparation) -> Outcome<String
     }
 }
 
-/// Digest of the exact compact JSON the provider receives as `arguments`.
-/// The authority compares it to the arguments the provider forwards.
+/// Digest of the call arguments in canonical form: compact JSON, object keys
+/// sorted at every level, UTF-8 unescaped. The authority recomputes it from
+/// the arguments the provider forwards. Key order is canonicalized here
+/// because serde_json may preserve insertion order in this build.
 pub(crate) fn arguments_digest(arguments: &Value) -> String {
-    let bytes = serde_json::to_vec(arguments).unwrap_or_default();
+    let bytes = serde_json::to_vec(&canonical(arguments)).unwrap_or_default();
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::with_capacity(object.len());
+            for key in keys {
+                sorted.insert(key.clone(), canonical(&object[key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
 }
 
 enum Exchange {
@@ -289,6 +307,18 @@ mod tests {
         assert_eq!(sent["native"]["request_id"], "req");
         assert_eq!(sent["arguments_sha256"], arguments_digest(&arguments));
         assert!(sent.get("arguments").is_none(), "raw arguments never leave");
+    }
+
+    #[test]
+    fn argument_digest_matches_service_canonical_form() {
+        // Shared vector with OMHQ scripts/test_acg_servicing.py: compact JSON,
+        // sorted keys, UTF-8 unescaped.
+        let arguments =
+            json!({"value": "h\u{e9}llo", "n": 3, "nested": {"b": [1, true, null], "a": "x\n"}});
+        assert_eq!(
+            arguments_digest(&arguments),
+            "ffdd66c0192996899d52da410eb56b110a662e014b111feeae954e50e0412cce"
+        );
     }
 
     #[test]
