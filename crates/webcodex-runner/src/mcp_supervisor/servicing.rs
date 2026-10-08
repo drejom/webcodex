@@ -28,6 +28,10 @@ enum Request<'a> {
         cgroup: &'a str,
         native: &'a NativeFence,
         tool: &'a str,
+        /// The exact MCP `tools/call` arguments the provider will receive. The
+        /// authority derives the operation it will accept from these, so the
+        /// provider cannot substitute a different call when it consumes.
+        arguments: &'a Value,
         arguments_sha256: String,
         /// Unix milliseconds; the authority refuses consume after this.
         expires_at_ms: u64,
@@ -87,6 +91,7 @@ pub(crate) fn prepare(socket: &Path, selection: &Selection<'_>) -> Outcome<Prepa
         cgroup: selection.cgroup,
         native: selection.native,
         tool: selection.tool,
+        arguments: selection.arguments,
         arguments_sha256: arguments_digest(selection.arguments),
         expires_at_ms,
     };
@@ -306,7 +311,8 @@ mod tests {
         assert_eq!(sent["cgroup"], "/x/wc-gen-gen");
         assert_eq!(sent["native"]["request_id"], "req");
         assert_eq!(sent["arguments_sha256"], arguments_digest(&arguments));
-        assert!(sent.get("arguments").is_none(), "raw arguments never leave");
+        // The authority receives the exact call so it can bind the effect.
+        assert_eq!(sent["arguments"], arguments);
     }
 
     #[test]
